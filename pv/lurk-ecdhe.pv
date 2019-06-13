@@ -1,0 +1,152 @@
+(* BEGIN PROVERIF SPEC  LURK TLS1.2 ECDHE *)
+set traceDisplay = long.
+set verboseClauses = explained.
+
+(* === DECLARATIONS === *)
+
+free pubCh:channel.
+free lurkCh:channel[private].
+free lurkChPriv:channel[private].
+free compromisedCh:channel.
+
+type lurkhdr.
+const TLS12RequestHeader, TLS12ECDHEInputPayload,
+    TLS12ResponseHeader, TLS12DigitallySignedPayloads,
+    TLS12ECDHEInputPayload_srvrand_helper,
+    TLS12DigitallySignedPayloads_helper:lurkhdr.
+
+type lurkkw.
+const MS:lurkkw.
+
+fun prf(bitstring, lurkkw, bitstring, bitstring):bitstring[private].
+
+(* ECDHE constructs *)
+
+type point.
+const G: point [data].
+fun point2bit(point): bitstring [data].
+fun ecdh_mult(point,bitstring):point.
+
+equation forall x:bitstring, y:bitstring;
+    ecdh_mult(ecdh_mult(G,x),y) =
+	ecdh_mult(ecdh_mult(G,y),x).
+
+letfun ecdhe_generation() =
+    new x:bitstring;
+    let gx = ecdh_mult(G,x) in
+    (x,gx).
+
+(* Signature and misc. constructs *)
+
+fun hash(bitstring):bitstring.
+type skey. (*private key*)
+type pkey. (*public key*)
+free privkey:skey [private].
+fun pk(skey): pkey. (*derivation of the public key from private key*)
+
+fun ECDSAsign(skey,bitstring):bitstring.
+
+fun ECDSAverify(pkey,bitstring,bitstring): bool
+    reduc forall k:skey, x:bitstring;
+    ECDSAverify(pk(k),x,ECDSAsign(k,x)) = true.
+
+type tlshdr.
+const ClientHello, ServerHello, ClientKeyExchange, ServerKeyExchange,
+        ServerHelloDone:tlshdr.
+
+(*freshness like a prf_k() with k shared between edge and keyserver*)
+type key.
+fun pfs(bitstring, key): bitstring[private].
+reduc forall m:bitstring, k:key; decpfs(pfs(m, k), k) = m.
+free pfsKey:key [private].
+
+(* EVENTS *)
+event edge_sent_srvrnd_clear(bitstring).
+event keyserver_recvd_srvrnd_clear(bitstring).
+
+(* Security properties *)
+query attacker(pfsKey).
+query attacker(privkey).
+query attacker(pk(privkey)).
+query secret clearSrvRnd.
+
+query srvRand:bitstring  ;
+    inj-event(keyserver_recvd_srvrnd_clear(srvRand))
+        ==> inj-event(edge_sent_srvrnd_clear(srvRand)).
+
+query secret mastersecretclient.
+query secret mastersecret.
+
+(* === PROCESS MACROS === *)
+
+let UE() = (* end-user *)
+	new client_random:bitstring;
+	out(pubCh,(ClientHello,client_random));
+	in(pubCh, (=ServerHello, srv_rnd:bitstring, pubcle:pkey,
+                =ServerKeyExchange, bG_srv:point, rec_sign:bitstring,
+                =ServerHelloDone));
+    if ECDSAverify(pubcle, hash((client_random, srv_rnd,
+                    point2bit(bG_srv))), rec_sign) = true then
+    (
+        let (a:bitstring, aG:point) = ecdhe_generation() in
+        out(pubCh, (ClientKeyExchange, aG));
+        let premsecret:bitstring = point2bit(ecdh_mult(bG_srv, a)) in
+        let mastersecretclient:bitstring =  prf (premsecret, MS,
+                                            client_random, srv_rnd)
+    ).
+
+let EdgeServer (pubKey:pkey, symk:key) =
+    in(pubCh,(=ClientHello,crnd:bitstring));
+    new clear_srv_rand:bitstring;
+    new nonceEdge:bitstring;
+    out(lurkChPriv, nonceEdge); (*nonce to KeyServer*)
+    in(lurkChPriv, (nonceKeyServ:bitstring, nonceE:bitstring));
+    if nonceE = nonceEdge then
+    (
+        let clearSrvRnd:bitstring = clear_srv_rand in
+        event edge_sent_srvrnd_clear(clearSrvRnd);
+        out (lurkChPriv, (TLS12ECDHEInputPayload_srvrand_helper,
+        clearSrvRnd, nonceKeyServ));
+        let (b:bitstring, bG:point) = ecdhe_generation() in
+        out(lurkCh, (TLS12RequestHeader,
+            TLS12ECDHEInputPayload, crnd, bG));
+        in (lurkChPriv,(=TLS12DigitallySignedPayloads_helper,
+            signedparams:bitstring));
+        in(lurkCh,(=TLS12ResponseHeader,=TLS12DigitallySignedPayloads));
+        out(pubCh, (ServerHello, pfs(clear_srv_rand,symk), pubKey,
+            ServerKeyExchange, bG, signedparams, ServerHelloDone));
+        in(pubCh, (=ClientKeyExchange, aG_client:point));
+        let pmsecret:bitstring = point2bit(ecdh_mult(aG_client, b)) in
+        let mastersecret:bitstring =  prf (pmsecret, MS,
+                                    crnd, pfs(clear_srv_rand,symk))
+    ).
+
+let KeyServer (secKey:skey,pubkey:pkey, symk:key) =
+    in (lurkChPriv, nonceE:bitstring);
+    new nonceKeyServ:bitstring;
+    out (lurkChPriv, (nonceKeyServ, nonceE));
+    in(lurkChPriv,(=TLS12ECDHEInputPayload_srvrand_helper,
+        recsrvrnd:bitstring, nonceKeyServRecv:bitstring));
+    if nonceKeyServRecv = nonceKeyServ then
+    (
+        event keyserver_recvd_srvrnd_clear(recsrvrnd);
+        in(lurkCh,(=TLS12RequestHeader, =TLS12ECDHEInputPayload,
+                    client_rnd:bitstring, bGsrv:point));
+        let srv_random:bitstring = pfs(recsrvrnd, symk) in
+        let signature:bitstring = ECDSAsign(secKey, hash((client_rnd,
+                                    srv_random, point2bit(bGsrv)))) in
+        out(lurkChPriv, (TLS12DigitallySignedPayloads_helper, signature));
+        out(lurkCh, (TLS12ResponseHeader, TLS12DigitallySignedPayloads))
+    ).
+
+(* === MAIN PROCESS === *)
+
+process
+    out(compromisedCh, lurkCh);
+    (*out(compromisedCh, lurkChPriv);*)
+    let publickey:pkey = pk(privkey) in
+    (
+		(!UE()) |
+		(!EdgeServer(publickey,pfsKey)) |
+		(!KeyServer(privkey,publickey,pfsKey))
+    )

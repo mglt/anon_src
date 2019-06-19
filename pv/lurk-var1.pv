@@ -1,0 +1,129 @@
+(* BEGIN PROVERIF SPEC Crypto Service TLS1.2 RSA - v2 *)
+set traceDisplay = long.
+set verboseClauses = explained.
+
+(* === DECLARATIONS === *)
+
+free pubCh:channel.
+free lurkCh:channel[private].
+free lurkChPriv:channel[private].
+free compromisedCh:channel.
+
+type skey.
+type pkey.
+type id.
+const PrfID:id.
+
+type lurkkw.
+const MS:lurkkw.
+type lurkhdr.
+const TLS12RequestHeader, TLS12MasterRSARequestPayload,
+    TLS12ResponseHeader, TLS12MasterResponsePayload,
+    TLS12MasterRSARequestPayload_srvrand_helper,
+    TLS12MasterResponsePayload_master_helper:lurkhdr.
+
+type tlshdr.
+const ClientHello, ServerHello, ClientKeyExchange:tlshdr.
+fun pk(skey): pkey.
+fun aenc(bitstring, pkey): bitstring[private].
+reduc forall m: bitstring, sk: skey; adec(aenc(m,pk(sk)),sk) = m[private].
+fun concat(bitstring, lurkkw, bitstring, bitstring):bitstring [data].
+fun prf(bitstring):bitstring.
+
+(*NEW: freshness like a prf_k() with k shared between edge and keyserver*)
+
+type key.
+fun pfs(bitstring, key): bitstring[private]. (*not accessible to attacker*)
+reduc forall m:bitstring, k:key; decpfs(pfs(m, k), k) = m[private].
+free pfsKey:key [private].
+
+fun getkeyid(pkey): id [data].
+free privkey:skey [private].
+
+(* EVENTS *)
+event client_sent_encpremaster(bitstring).
+event edge_sent_srvrnd_clear(bitstring).
+event keyserver_recvd_srvrnd_clear(bitstring).
+
+(* Security properties *)
+query attacker(pfsKey).
+query attacker(pk(privkey)).
+query secret clearSrvRnd.
+
+query srvRand:bitstring  ;
+    inj-event(keyserver_recvd_srvrnd_clear(srvRand))
+        ==> inj-event(edge_sent_srvrnd_clear(srvRand)).
+
+query secret mastersecretclient.
+query secret mastersecret.
+
+(* === PROCESS MACROS === *)
+
+let UE() = (* end-user *)
+	new client_random:bitstring;
+	out(pubCh,(ClientHello,client_random));
+	in(pubCh,(=ServerHello,srnd:bitstring,pubServKey:pkey));
+	new premaster:bitstring;
+	event client_sent_encpremaster(premaster);
+	out (pubCh,(ClientKeyExchange, aenc(premaster,pubServKey)));
+	let concparamsclient:bitstring = concat(premaster,MS,client_random,srnd) in
+    let mastersecretclient:bitstring = prf(concparamsclient).
+
+let EdgeServer(pubKey:pkey,kid:id,symk:key) =
+	in(pubCh,(=ClientHello,crnd:bitstring));
+	new clear_srv_rand:bitstring;
+    let server_random:bitstring = pfs(clear_srv_rand, symk) in
+	out(pubCh,(ServerHello,server_random,pubKey));
+	in(pubCh,(=ClientKeyExchange,encpremaster:bitstring));
+
+    new nonceEdge:bitstring;
+    out(lurkChPriv, nonceEdge); (*nonce to KeyServer*)
+    in(lurkChPriv, (nonceKeyServ:bitstring, nonceE:bitstring));
+    if nonceE = nonceEdge then
+    (
+        let clearSrvRnd:bitstring = clear_srv_rand in
+        event edge_sent_srvrnd_clear(clearSrvRnd);
+        out (lurkChPriv, (TLS12MasterRSARequestPayload_srvrand_helper,
+                clearSrvRnd, nonceKeyServ));
+        out(lurkCh,(TLS12RequestHeader,TLS12MasterRSARequestPayload,kid,crnd,
+            PrfID,encpremaster));
+        in (lurkChPriv,(=TLS12MasterResponsePayload_master_helper,
+            mastersec:bitstring));
+        in(lurkCh,(=TLS12ResponseHeader,=TLS12MasterResponsePayload))
+    ).
+
+let KeyServer(secKey:skey,pubkey:pkey, symk:key) =
+    in (lurkChPriv, nonceE:bitstring);
+    new nonceKeyServ:bitstring;
+    out (lurkChPriv, (nonceKeyServ, nonceE));
+    in(lurkChPriv,(=TLS12MasterRSARequestPayload_srvrand_helper,
+        recsrvrnd:bitstring, nonceKeyServRecv:bitstring));
+    if nonceKeyServRecv = nonceKeyServ then
+    (
+        event keyserver_recvd_srvrnd_clear(recsrvrnd);
+        let srv_random:bitstring = pfs(recsrvrnd, symk) in
+        in(lurkCh,(=TLS12RequestHeader,=TLS12MasterRSARequestPayload,keyID:id,
+            client_rnd:bitstring,=PrfID,encryptedpremastersecret:bitstring));
+        let premasterdec:bitstring = adec(encryptedpremastersecret, privkey) in
+        let concparams:bitstring = concat(premasterdec,MS,
+                                            client_rnd,srv_random) in
+        let mastersecret:bitstring = prf(concparams) in
+        out (lurkChPriv, (TLS12MasterResponsePayload_master_helper, mastersecret));
+        out(lurkCh,(TLS12ResponseHeader,TLS12MasterResponsePayload))
+    ).
+
+(* === MAIN PROCESS === *)
+
+process
+    out(compromisedCh, lurkCh);
+    (*out(compromisedCh, lurkChPriv);*)
+    let publickey = pk(privkey) in
+
+	let keyid:id = getkeyid(publickey) in
+    (
+		(!UE()) |
+		(!EdgeServer(publickey,keyid,pfsKey)) |
+		(!KeyServer(privkey,publickey,pfsKey))
+    )
+
+
